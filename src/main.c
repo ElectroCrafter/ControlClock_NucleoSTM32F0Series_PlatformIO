@@ -4,6 +4,7 @@
 #define ledPin GPIO_PIN_5
 volatile uint32_t millis_count = 0;
 
+/*
 Objective   : 
 Button Press Detection
     1. Blinking without delay using upcouter timer2 channel 2 at the PA1
