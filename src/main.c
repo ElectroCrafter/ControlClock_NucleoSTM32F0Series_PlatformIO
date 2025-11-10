@@ -1,9 +1,6 @@
 #include "stm32f0xx.h"
 #include <stdlib.h>
-#define _OPEN_SYS_ITOA_EXT
-#define ledPin GPIO_PIN_5
-volatile uint32_t millis_count = 0;
-
+#include <stdbool.h>
 /*
 Objective   : 
 Button Press Detection
@@ -39,6 +36,11 @@ Notes       :
     - re-create a basic foundation counter code only using TIM2 ->ARR and TIM2 ->PSC 
 */
 
+#define UART_BUFFER_SIZE 8 // Using 64 instead of 2 for safety
+#define _OPEN_SYS_ITOA_EXT
+#define ledPin GPIO_PIN_5
+volatile uint32_t millis_count = 0;
+
 typedef enum {
     INT,
     FLOAT,
@@ -49,9 +51,58 @@ typedef enum {
     STRING
 } DataType;
 
+// Define circular buffer structure
+typedef struct {
+    uint8_t buffer[UART_BUFFER_SIZE];
+    volatile uint8_t head; // Index for the next write operation
+    volatile uint8_t tail; // Index for the next read operation
+} CircularBuffer;
+
+CircularBuffer uart_buffer; // Create the global instance for UART
+
+// Initialize circular buffer
+void CircularBuffer_Init(CircularBuffer *buf) {
+    buf->head = 0;
+    buf->tail = 0;
+}
+
+// Check if buffer is empty
+bool CircularBuffer_IsEmpty(CircularBuffer *buf) {
+    // Empty if head and tail are at the same spot
+    return (buf->head == buf->tail);
+}
+
+// Check if buffer is full
+bool CircularBuffer_IsFull(CircularBuffer *buf) {
+    // Full if the *next* head position would be the current tail
+    uint8_t next_head = (buf->head + 1) % UART_BUFFER_SIZE;
+    return (next_head == buf->tail);
+}
+
+// Add data to buffer (for the interrupt to use)
+void CircularBuffer_Write(CircularBuffer *buf, uint8_t data) {
+    // Check if the buffer is full *before* writing
+    if (CircularBuffer_IsFull(buf)) {
+        // Buffer is full, lose the data (or handle error)
+        return;
+    }
+    
+    buf->buffer[buf->head] = data;
+    buf->head = (buf->head + 1) % UART_BUFFER_SIZE;
+}
+
+// Read data from buffer (for main() to use)
+uint8_t CircularBuffer_Read(CircularBuffer *buf) {
+    // (We assume IsEmpty check is done *before* calling this)
+    uint8_t data = buf->buffer[buf->tail];
+    buf->tail = (buf->tail + 1) % UART_BUFFER_SIZE;
+    return data;
+}
+
 void sysInit(void){
 
     /*
+    HSI
     Set the Flash ACR to use 1 wait-state and enable the prefetch buffer and pre-read.
     -> if SYSCLK <= 24MHz           : 0 or zero wait state     0
     -> if 24MHz<= SYSCLK <= 48MHz   : 1 or 1 wait state        FLASH_ACR_LATENCY
@@ -87,29 +138,164 @@ void sysInit(void){
 
 }
 
-void GPIOinit(){
-    RCC->AHBENR |= RCC_AHBENR_GPIOAEN;    // enable GPIOA clock 
-    GPIOA->MODER |= GPIO_MODER_MODER5_0 ; //general purpose output mode on pin A5
+void sysInit_48MHz(void) {
+    // 1. Set Flash Latency to 1 wait state (required for 48MHz)
+    FLASH->ACR &= ~FLASH_ACR_LATENCY; //clear all bits
+    FLASH->ACR |= FLASH_ACR_LATENCY;
+    
+    // Enable Prefetch Buffer
+    FLASH->ACR |= FLASH_ACR_PRFTBE;
 
+    // 2. Configure PLL: (HSI(8MHz) / 2) * 12 = 48MHz
+    
+    // First, set PREDIV in CFGR2 to /2
+    RCC->CFGR2 &= ~RCC_CFGR2_PREDIV; // Clear
+    RCC->CFGR2 |= RCC_CFGR2_PREDIV_DIV2; // Set /2
+
+    // Second, configure CFGR
+    RCC->CFGR &= ~(RCC_CFGR_PLLMUL | RCC_CFGR_PLLSRC); // Clear
+    RCC->CFGR |= (RCC_CFGR_PLLSRC_HSI_PREDIV | // Use HSI/PREDIV as source
+                  RCC_CFGR_PLLMUL12);       // Set multiplier to x12
+
+    // 3. Turn the PLL on and wait for it to be ready.
+    RCC->CR |= RCC_CR_PLLON;
+    while (!(RCC->CR & RCC_CR_PLLRDY)) {
+    };
+
+// --- 4. NEW: Configure Bus Prescalers ---
+    // HPRE = /1 (AHB Clock = SYSCLK = 48MHz)
+    RCC->CFGR &= ~RCC_CFGR_HPRE;
+    RCC->CFGR |= RCC_CFGR_HPRE_DIV1;
+    
+    // PPRE1 = /1 (APB1 Clock = AHB Clock = 48MHz)
+    // IMPORTANT: PCLK1 must not exceed 48MHz. This is OK.
+    RCC->CFGR &= ~RCC_CFGR_PPRE;
+    RCC->CFGR |= RCC_CFGR_PPRE_DIV1;
+    // --- End of NEW ---
+
+    // 5. Select the PLL as the system clock source.
+    RCC->CFGR &= ~RCC_CFGR_SW;
+    RCC->CFGR |= RCC_CFGR_SW_PLL;
+    while (!(RCC->CFGR & RCC_CFGR_SWS_PLL)) {
+    };
+    
+    // 6. Update the SystemCoreClock variable (for UART/Timer math)
+    SystemCoreClock = 48000000;
+}
+
+void GPIOinit(){
+    // enable GPIOA clock
+    RCC->AHBENR |= RCC_AHBENR_GPIOAEN; 
+
+    // // enable GPIOB clock
+    // RCC->AHBENR |= RCC_AHBENR_GPIOBEN; 
+
+    // // enable GPIOC clock
+    // RCC->AHBENR |= RCC_AHBENR_GPIOCEN; 
+    //general purpose output mode on pin A5
+    GPIOA->MODER |= GPIO_MODER_MODER5_0 ; 
+}
+
+void MCOInit(void){
+    /* README
+    Once you call MCOInit(), the MCU's hardware takes over. 
+    The RCC peripheral is now permanently configured to route the SYSCLK 
+    signal directly to the GPIO PA8 pin in the background.
+    */
+
+    // --- 1. Configure PA8 Pin ---
+    // (Assumes GPIOA clock is already enabled by GPIOinit())
+
+    // Set PA8 to High Speed (11)
+    GPIOA->OSPEEDR |= GPIO_OSPEEDR_OSPEEDR8;
+
+    // Set PA8 to Alternate Function (10)
+    // First, clear the bits for PA8
+    GPIOA->MODER &= ~GPIO_MODER_MODER8; 
+    // Then, set the bits for AF (10)
+    GPIOA->MODER |= GPIO_MODER_MODER8_1; 
+
+    // Set PA8 alternate function to AF0 (MCO)
+    // PA8 is on AFR[1] (high register), bits [3:0]
+    // We clear the 4 bits to 0b0000, which selects AF0.
+    GPIOA->AFR[1] &= ~GPIO_AFRH_AFSEL8_Msk;
+
+    // --- 2. Configure RCC MCO Output ---
+
+    //// Clear MCO selection bits [26:24]
+    // RCC->CFGR &= ~RCC_CFGR_MCO; 
+
+    // // Select SYSCLK as MCO source (0b110)
+    RCC->CFGR |= RCC_CFGR_MCO_SYSCLK;
+
+    // // Select system clock to be output on the MCO HSE
+    // RCC->CFGR |= RCC_CFGR_MCO_HSE;
+
+    // Select system clock to be output on the MCO HSI
+    // RCC->CFGR |= RCC_CFGR_MCO_HSI;
+
+    // // Select system clock to be output on the MCO HSI48
+    // RCC->CFGR |= RCC_CFGR_MCO_HSI48;
+
+    // --- 3. Configure RCC MCO Output ---
+    // uint32_t temp_cfgr = RCC->CFGR;
+    
+    // // Clear MCO bits [26:24]
+    // temp_cfgr &= ~RCC_CFGR_MCO; 
+    
+    // // Select SYSCLK as MCO source (0b110)
+    // temp_cfgr |= RCC_CFGR_MCO_SYSCLK;
+
+    // // Apply the new configuration
+    // RCC->CFGR = temp_cfgr;
 }
 
 void USART2_Init(void) {
+    uint32_t mul8Mhz = SystemCoreClock / 8000000;
+
     // Enable USART2 clock
     RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
 
     //configure system clock selected as USART2 or UART2 clock
     RCC->CFGR3 |= RCC_CFGR3_USART2SW;
 
-    // Configure GPIOA pins for USART2
-    RCC->AHBENR |= RCC_AHBENR_GPIOAEN; // Enable GPIOA clock
-    GPIOA->MODER |= GPIO_MODER_MODER2_1 | GPIO_MODER_MODER3_1; // Alternate function mode for PA2 and PA3
-    GPIOA->AFR[0] |= (1 << (2 * 4)) | (1 << (3 * 4)); // AF1 for PA2 and PA3
+    /* Configure GPIOA pins for USART2
+    (1) Enable GPIOA clock
+    (2) Alternate function mode for PA2 and PA3
+    (3) Alteranate functio1 (AF1) for PA2 and PA3
+    */
+    RCC->AHBENR |= RCC_AHBENR_GPIOAEN; //(1)
+    GPIOA->MODER |= GPIO_MODER_MODER2_1 | GPIO_MODER_MODER3_1; // (2)
+    GPIOA->AFR[0] |= (1 << (2 * 4)) | (1 << (3 * 4)); // (3)
 
-    // Configure USART2
-    USART2->CR1 &= ~USART_CR1_UE; // Disable USART2
-    USART2->BRR = SystemCoreClock / (9600); // Set baud rate to 38400
-    USART2->CR1 |= USART_CR1_TE | USART_CR1_RE; // Enable transmitter and receiver
-    USART2->CR1 |= USART_CR1_UE; // Enable USART2
+    /* Configure USART2
+    (4) Disable USART2
+    (5) Set baud rate to 9600
+    (6) Enable transmitter and receiver
+    (7) Enable RXNE (Receive Not Empty) Interrupt  
+    (8) Enable USART2 interrupt in the NVIC
+    (9) Enable USART2
+    */
+    USART2->CR1 &= ~USART_CR1_UE; // (4)
+    USART2->BRR = SystemCoreClock / (9600*mul8Mhz); // (5)
+    USART2->CR1 |= USART_CR1_TE | USART_CR1_RE; // (6)
+    USART2->CR1 |= USART_CR1_RXNEIE; // (7)
+    NVIC_EnableIRQ(USART2_IRQn);  // (8)
+    USART2->CR1 |= USART_CR1_UE; //(9)
+}
+
+// UART receive interrupt handler
+void USART2_IRQHandler(void) {
+    // Check if the RXNE flag is set (data is ready to be read)
+    if (USART2->ISR & USART_ISR_RXNE) { 
+        
+        // Read the data from the hardware register
+        // (This also clears the RXNE interrupt flag)
+        uint8_t received_data = USART2->RDR; 
+        
+        // Put the data into our "mailbox"
+        CircularBuffer_Write(&uart_buffer, received_data); 
+    }
 }
 
 void USART2_SendChar(char ch) {
@@ -176,7 +362,7 @@ void serialPrint(void* data, DataType type) {
 
 void confTimPol(uint16_t tDelay){
 /*
-    Timer without interrupt using an internal clock 8 Mhz
+    Timer without interrupt in every single clock
   1. Enable timer 2
   2. enable GPIOA at GPIOinit function
   3. Select PA1 as an alternate pin TIM2_CH2 || Bit Masking Technique: Bit Clearing and Setting
@@ -192,7 +378,7 @@ void confTimPol(uint16_t tDelay){
     |(GPIO_MODER_MODER1_1);               //(3)
     GPIOA ->AFR[0] |= (0b10 <<4);         //(4)
     //time-base unit
-    TIM2 ->PSC = 24000-1;            //(5)
+    TIM2 ->PSC = (SystemCoreClock/1000)-1;  //(5)
     TIM2 ->ARR = 4000-1;            //(6)
 
     /*Detail Calculation*/
@@ -222,18 +408,27 @@ uint32_t millis(void) {
     // Return the current value of the global millis_count
     return millis_count;
 }
-
+void serialDebug(char *dataIn){
+    if (*dataIn=='a'){
+        serialPrint("vPack:X\tvCell1:X\tvCell2:X\tcurrentPack:X\ttemp1:X\n",STRING);
+    }
+}
 int main(void) {
     // Initialize internal system clock 8Mhz
     // SystemInit();
     // Initialize internal system clock 48Mhz
-    sysInit();
+    sysInit_48MHz();
     // Initialize GPIO led A5
     GPIOinit();
     //Initialize UART communication
     USART2_Init();
     //initialze timer 2
     confTimPol(0);
+    //initialze Microcontroller Clock Output 
+    MCOInit();
+    //initialze UART Circullar Buffer
+    CircularBuffer_Init(&uart_buffer);
+
     //millis variables
     uint32_t prevMillis = 0;            // Read current counter value;
     uint32_t interval =1000;
@@ -243,6 +438,19 @@ int main(void) {
     uint32_t prev_counter = 0;
     uint8_t delta;
     while (1) {
+        // --- UART ECHO ---//
+        if (!CircularBuffer_IsEmpty(&uart_buffer)) {
+            // Data is in the mailbox!
+            uint8_t data_from_uart = CircularBuffer_Read(&uart_buffer);
+            
+            // Echo it back to the terminal
+            // serialPrint(&data_from_uart, CHR);
+            // serialPrint("haha",STRING);
+
+            //debugging BMS system
+            serialDebug(&data_from_uart);
+        }
+
         curr_counter = TIM2->CNT;
         // Timer using interrupt or blinking without delay or delay generation
 
@@ -278,17 +486,18 @@ int main(void) {
                 pllSrc = 2;
             }
 
-            uint32_t readClock = (SystemCoreClock/pllSrc)*pllMul;
             char symblChr = '\t';
             
             // USART2_SendChar('\t');
-            // serialPrint(&readClock,UINT32);
+            serialPrint("SystemClock:",STRING);
+            serialPrint(&SystemCoreClock,UINT32);
+            serialPrint("Hz",STRING);
             // serialPrint(&symblChr,CHR);
             // serialPrint(&pllSrc,UINT8);
             // serialPrint(&symblChr,CHR);
             // serialPrint(&pllMul,UINT8);
             USART2_SendChar('\n');
-            USART2_SendChar(sizeof(DataType));
+            // USART2_SendChar(sizeof(DataType));
             
             GPIOA -> ODR ^= ledPin; 
             USART2_SendChar('\n');
